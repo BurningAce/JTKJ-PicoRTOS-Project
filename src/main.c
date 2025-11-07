@@ -1,6 +1,6 @@
-
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #include <pico/stdlib.h>
 
@@ -9,6 +9,13 @@
 #include <task.h>
 
 #include "tkjhat/sdk.h"
+
+#define IMU_SAMPLE_COUNT 10
+#define IMU_SAMPLE_DELAY_MS 50
+#define DOT_THRESHOLD 900
+#define DASH_THRESHOLD 900
+#define QUEUE_LENGTH 64
+#define QUEUE_ITEM_SIZE sizeof(char)
 
 // Exercise 4. Include the libraries necessaries to use the usb-serial-debug, and tinyusb
 // Tehtävä 4 . Lisää usb-serial-debugin ja tinyusbin käyttämiseen tarvittavat kirjastot.
@@ -21,8 +28,21 @@
 
 // Tehtävä 3: Tilakoneen esittely Add missing states.
 // Exercise 3: Definition of the state machine. Add missing states.
-enum state { WAITING=1, DATA_READY=2};
-enum state programState = WAITING;
+enum state { 
+    IDLE, 
+    DETECTING, 
+    SYMBOL_READY, 
+    SENDING,
+    RECEIVING,
+    DISPLAYING 
+};
+
+enum state programState = IDLE; // Start in IDLE state
+
+
+/* Globaali kahva jonolle */
+QueueHandle_t messageQueue;
+
 
 // Tehtävä 3: Valoisuuden globaali muuttuja
 // Exercise 3: Global variable for ambient light
@@ -33,15 +53,28 @@ static void btn_fxn(uint gpio, uint32_t eventMask) {
     //            Tarkista SDK, ja jos et löydä vastaavaa funktiota, sinun täytyy toteuttaa se itse.
     // Exercise 1: Toggle the LED. 
     //             Check the SDK and if you do not find a function you would need to implement it yourself. 
-    toggle_led();
+    char symbol;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    if (gpio == BUTTON1) {
+        symbol = ' ';
+        xQueueSendFromISR(messageQueue, &symbol, &xHigherPriorityTaskWoken);
+    } else if (gpio == BUTTON2) {
+        symbol = '\n'; /* Rivinvaihto = uusi viesti TODO: Käytä tilakonetta */
+        xQueueSendFromISR(messageQueue, &symbol, &xHigherPriorityTaskWoken);
+    }
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+
 }
 
 static void sensor_task(void *arg){
     (void)arg;
-    // Tehtävä 2: Alusta valoisuusanturi. Etsi SDK-dokumentaatiosta sopiva funktio.
-    // Exercise 2: Init the light sensor. Find in the SDK documentation the adequate function.
-    init_veml6030();
-   
+
+    char detected_symbol;
+
+
+
     for(;;){
         
         // Tehtävä 2: Muokkaa tästä eteenpäin sovelluskoodilla. Kommentoi seuraava rivi.
@@ -62,23 +95,68 @@ static void sensor_task(void *arg){
         //             If you are in adequate state, instead of printing save the sensor value 
         //             into the global variable.
         //             After that, modify state
-        if (programState == WAITING) {
-            ambientLight = veml6030_read_light();
-            programState = DATA_READY;
+        if (programState == DETECTING) {
+            long total_x = 0;
+            long total_z = 0; /* HAT:n z-akseli! */
+
+            for (int i = 0; i < IMU_SAMPLE_COUNT; i++) {
+                float accel_x, accel_y, accel_z;
+                float gyro_x, gyro_y, gyro_z;
+                float temp;
+
+                if (!ICM42670_read_sensor_data(&accel_x, &accel_y, &accel_z, &gyro_x, &gyro_y, &gyro_z, &temp)) { /* onnistuiko? */
+                    total_x += accel_x;
+                    total_z += accel_y;
+                }
+                vTaskDelay(pdMS_TO_TICKS(IMU_SAMPLE_DELAY_MS));
+            }
+            // Step 2: Calculate the average g-force on each primary axis
+            float avg_x = total_x / IMU_SAMPLE_COUNT;
+            float avg_z = total_z / IMU_SAMPLE_COUNT;
+            
+            bool symbol_found = false;
+
+            if (avg_z > DOT_THRESHOLD && fabs(avg_x) < 0.2f) {
+                detected_symbol = '.';
+                symbol_found = true;
+                printf("Dot detected (avg_z = %f g)\n", avg_z);
+
+            // DASH: Device is tilted 90 degrees. Gravity is on the X-axis, and not on the Z-axis.
+            } else if (avg_x > DASH_THRESHOLD && fabs(avg_z) < 0.2f) {
+                detected_symbol = '-';
+                symbol_found = true;
+                printf("Dash detected (avg_x = %f g)\n", avg_x);
+            }
+
+            if (symbol_found) {
+                // Step 4: Send the character to the processing queue
+                if (xQueueSend(messageQueue, &detected_symbol, (TickType_t)10) != pdPASS) {
+                    printf("Failed to send symbol to queue.\n");
+                }
+                
+                // Step 5: Go to IDLE and wait, forcing the user to move the device
+                // back to a neutral position before detecting the next symbol.
+                programState = IDLE; 
+                vTaskDelay(pdMS_TO_TICKS(500)); // Cooldown period
+            }
         }
+
+        // Yield the CPU briefly when not in the DETECTING state
+        vTaskDelay(pdMS_TO_TICKS(100));
 
         // Exercise 2. Just for sanity check. Please, comment this out
         // Tehtävä 2: Just for sanity check. Please, comment this out
-        printf("sensorTask\n");
+        //printf("sensorTask\n");
 
         // Do not remove this
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        //vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 static void print_task(void *arg){
     (void)arg;
-    
+    char received_symbol;
+
     while(1){
         
         // Tehtävä 3: Kun tila on oikea, tulosta sensoridata merkkijonossa debug-ikkunaan
@@ -88,14 +166,13 @@ static void print_task(void *arg){
         //             Remember to modify state
         //             Do not forget to comment next line of code.
         //tight_loop_contents();
-        if (programState == DATA_READY) {
-            printf("%d", ambientLight);
-            programState = WAITING;
+        if (xQueueReceive(messageQueue, &received_symbol, portMAX_DELAY) == pdPASS)
+        {
+            // Print the received character to the USB serial console for testing
+            printf("%c", received_symbol);
+            fflush(stdout); // Ensure the character is printed immediately
         }
-        
 
-
-        
         // Exercise 4. Use the usb_serial_print() instead of printf or similar in the previous line.
         //             Check the rest of the code that you do not have printf (substitute them by usb_serial_print())
         //             Use the TinyUSB library to send data through the other serial port (CDC 1).
@@ -158,24 +235,47 @@ int main() {
     }*/ 
     
     init_hat_sdk();
+
+
     sleep_ms(300); //Wait some time so initialization of USB and hat is done.
+   if (ICM42670_startAccel(ICM42670_ACCEL_ODR_DEFAULT, ICM42670_ACCEL_FSR_DEFAULT) != 0) {
+        printf("FATAL: Failed to start accelerometer\n");
+        while(1);
+    }
+    // We choose 250 degrees/sec for the gyro, sensitive enough for hand movements.
+    if (ICM42670_startGyro(ICM42670_GYRO_ODR_DEFAULT,ICM42670_GYRO_FSR_DEFAULT) != 0) {
+        printf("FATAL: Failed to start gyroscope\n");
+        while(1);
+    }
+
+    sleep_ms(100); // Give the sensor a moment to stabilize after starting
+
 
     // Exercise 1: Initialize the button and the led and define an register the corresponding interrupton.
     //             Interruption handler is defined up as btn_fxn
     // Tehtävä 1:  Alusta painike ja LEd ja rekisteröi vastaava keskeytys.
     //             Keskeytyskäsittelijä on määritelty yläpuolella nimellä btn_fxn
+    /* Alustetaan liikesensori. */
+    init_ICM42670();
+
+    /* Alustetaan napit ja LED */
     gpio_init(BUTTON1);
     gpio_set_dir(BUTTON1, GPIO_IN);
-    
+    gpio_init(BUTTON2);
+    gpio_set_dir(BUTTON2, GPIO_IN);
     gpio_init(LED1);
     gpio_set_dir(LED1, GPIO_OUT);
 
     gpio_set_irq_enabled_with_callback(BUTTON1, GPIO_IRQ_EDGE_RISE, true, btn_fxn);
+    gpio_set_irq_enabled_with_callback(BUTTON2, GPIO_IRQ_EDGE_RISE, true, btn_fxn);
 
 
+    messageQueue = xQueueCreate(QUEUE_LENGTH, QUEUE_ITEM_SIZE);
+    if (!messageQueue) {
+        printf("Failed to init message queue");
+        return -1;
+    }
     
-    
-    TaskHandle_t hSensorTask, hPrintTask, hUSB = NULL;
 
     // Exercise 4: Uncomment this xTaskCreate to create the task that enables dual USB communication.
     // Tehtävä 4: Poista tämän xTaskCreate-rivin kommentointi luodaksesi tehtävän,
@@ -189,13 +289,19 @@ int main() {
     */
 
 
-    // Create the tasks with xTaskCreate
+    TaskHandle_t hSensorTask, hPrintTask;
+
+    // Create the tasks
+    xTaskCreate(sensor_task, "SensorTask", DEFAULT_STACK_SIZE, NULL, 2, &hSensorTask);
+    xTaskCreate(print_task, "UartTask", DEFAULT_STACK_SIZE, NULL, 3, &hPrintTask); // Higher priority
+
+    /* Create the tasks with xTaskCreate
     BaseType_t result = xTaskCreate(sensor_task, // (en) Task function
                 "sensor",                        // (en) Name of the task 
                 DEFAULT_STACK_SIZE,              // (en) Size of the stack for this task (in words). Generally 1024 or 2048
                 NULL,                            // (en) Arguments of the task 
                 2,                               // (en) Priority of this task
-                &hSensorTask);                   // (en) A handle to control the execution of this task
+                &);                   // (en) A handle to control the execution of this task
 
     if(result != pdPASS) {
         printf("Sensor task creation failed\n");
@@ -212,6 +318,7 @@ int main() {
         printf("Print Task creation failed\n");
         return 0;
     }
+    */
 
     // Start the scheduler (never returns)
     vTaskStartScheduler();
